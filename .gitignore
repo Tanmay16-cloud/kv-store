@@ -1,0 +1,10 @@
+build/
+out/
+.cache/
+.vs/
+.vscode/
+*.user
+*.log
+*.db
+*.wal
+.write_probe
