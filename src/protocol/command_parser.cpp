@@ -60,12 +60,62 @@ std::optional<Command> CommandParser::Parse(std::string_view input) {
     const auto [command_token, remainder] = SplitFirstToken(input);
     const auto command = ToLowerAscii(command_token);
 
+    if (command == "repl") {
+        auto replicated = CommandParser::Parse(remainder);
+        if (!replicated.has_value() || replicated->is_replicated) {
+            return std::nullopt;
+        }
+        if (replicated->type != CommandType::Set && replicated->type != CommandType::Del) {
+            return std::nullopt;
+        }
+        replicated->is_replicated = true;
+        return replicated;
+    }
+
     if (command == "quit" || command == "exit") {
         if (HasUnexpectedTrailingText(remainder)) {
             return std::nullopt;
         }
 
-        return Command{CommandType::Quit, {}, {}};
+        return Command{CommandType::Quit, {}, {}, false};
+    }
+
+    if (command == "metrics") {
+        if (HasUnexpectedTrailingText(remainder)) {
+            return std::nullopt;
+        }
+
+        return Command{CommandType::Metrics, {}, {}, false};
+    }
+
+    if (command == "cluster") {
+        const auto [subcommand_token, subcommand_remainder] = SplitFirstToken(remainder);
+        if (subcommand_token.empty()) {
+            return std::nullopt;
+        }
+
+        const auto subcommand = ToLowerAscii(subcommand_token);
+        if (subcommand == "info") {
+            if (HasUnexpectedTrailingText(subcommand_remainder)) {
+                return std::nullopt;
+            }
+            return Command{CommandType::ClusterInfo, {}, {}, false};
+        }
+        if (subcommand == "nodes") {
+            if (HasUnexpectedTrailingText(subcommand_remainder)) {
+                return std::nullopt;
+            }
+            return Command{CommandType::ClusterNodes, {}, {}, false};
+        }
+        if (subcommand == "key") {
+            const auto [key_token, trailing] = SplitFirstToken(subcommand_remainder);
+            if (key_token.empty() || HasUnexpectedTrailingText(trailing)) {
+                return std::nullopt;
+            }
+            return Command{CommandType::ClusterKey, std::string(key_token), {}, false};
+        }
+
+        return std::nullopt;
     }
 
     if (command == "set") {
@@ -79,7 +129,7 @@ std::optional<Command> CommandParser::Parse(std::string_view input) {
             return std::nullopt;
         }
 
-        return Command{CommandType::Set, std::string(key_token), std::string(value)};
+        return Command{CommandType::Set, std::string(key_token), std::string(value), false};
     }
 
     if (command == "get" || command == "del" || command == "exists") {
@@ -89,12 +139,12 @@ std::optional<Command> CommandParser::Parse(std::string_view input) {
         }
 
         if (command == "get") {
-            return Command{CommandType::Get, std::string(key_token), {}};
+            return Command{CommandType::Get, std::string(key_token), {}, false};
         }
         if (command == "del") {
-            return Command{CommandType::Del, std::string(key_token), {}};
+            return Command{CommandType::Del, std::string(key_token), {}, false};
         }
-        return Command{CommandType::Exists, std::string(key_token), {}};
+        return Command{CommandType::Exists, std::string(key_token), {}, false};
     }
 
     return std::nullopt;

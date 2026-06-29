@@ -40,4 +40,22 @@ std::size_t KeyValueStore::Size() const {
     return data_.size();
 }
 
+std::vector<std::pair<std::string, std::string>> KeyValueStore::Snapshot() const {
+    std::shared_lock lock(mutex_);
+    std::vector<std::pair<std::string, std::string>> entries;
+    entries.reserve(data_.size());
+    for (const auto& [key, value] : data_) {
+        entries.emplace_back(key, value);
+    }
+    return entries;
+}
+
+void KeyValueStore::ReplaceAll(std::vector<std::pair<std::string, std::string>> entries) {
+    std::unique_lock lock(mutex_);
+    data_.clear();
+    for (auto& [key, value] : entries) {
+        data_.emplace(std::move(key), std::move(value));
+    }
+}
+
 }  // namespace kvstore::storage
