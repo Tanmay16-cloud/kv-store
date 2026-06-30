@@ -154,6 +154,17 @@ void TestCommandParser() {
     }
 
     {
+        const auto parsed = CommandParser::Parse("ping");
+        Expect(parsed.has_value(), "ping command should parse");
+        Expect(parsed->type == CommandType::Ping, "ping command type should match");
+    }
+
+    {
+        const auto parsed = CommandParser::Parse("ping now");
+        Expect(!parsed.has_value(), "ping with trailing text should fail");
+    }
+
+    {
         const auto parsed = CommandParser::Parse("CLUSTER NODES");
         Expect(parsed.has_value(), "cluster nodes command should parse");
         Expect(parsed->type == CommandType::ClusterNodes, "cluster nodes type should match");
@@ -246,6 +257,12 @@ void TestCommandExecutor() {
         const auto result = ExecuteCommand(store, Command{CommandType::Metrics, {}, {}});
         ExpectEqual(result.response, std::string("ERR metrics unavailable"),
                     "metrics should fail without a metrics provider");
+    }
+
+    {
+        const auto result = ExecuteCommand(store, Command{CommandType::Ping, {}, {}});
+        ExpectEqual(result.response, std::string("PONG"), "ping should return PONG");
+        Expect(!result.should_close, "ping should keep connection open");
     }
 
     {
@@ -374,9 +391,15 @@ void TestRaftElectionState() {
     Expect(!second_candidate_vote.vote_granted, "node should not vote twice in same term");
 
     node.BecomeLeader();
-    const auto heartbeat = node.HandleHeartbeat(HeartbeatRequest{3, "node-c"});
+    node.ObserveTerm(3);
+    ExpectEqual(node.CurrentTerm(), static_cast<std::uint64_t>(3),
+                "observing a newer term should update term");
+    Expect(node.Role() == NodeRole::Follower, "observing a newer term should step down");
+
+    node.BecomeLeader();
+    const auto heartbeat = node.HandleHeartbeat(HeartbeatRequest{4, "node-c"});
     Expect(heartbeat.accepted, "newer heartbeat should be accepted");
-    ExpectEqual(node.CurrentTerm(), static_cast<std::uint64_t>(3), "heartbeat should update term");
+    ExpectEqual(node.CurrentTerm(), static_cast<std::uint64_t>(4), "heartbeat should update term");
     Expect(node.Role() == NodeRole::Follower, "newer heartbeat should step leader down");
 }
 

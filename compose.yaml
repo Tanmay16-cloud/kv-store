@@ -1,0 +1,123 @@
+name: kvstore-demo
+
+x-kvstore-base: &kvstore-base
+  build:
+    context: .
+  image: kvstore:local
+  restart: unless-stopped
+
+x-healthcheck-5000: &healthcheck-5000
+  test: ["CMD-SHELL", "printf 'PING\nQUIT\n' | kv-cli 127.0.0.1 5000 | grep -q PONG"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 5s
+
+x-healthcheck-5001: &healthcheck-5001
+  test: ["CMD-SHELL", "printf 'PING\nQUIT\n' | kv-cli 127.0.0.1 5001 | grep -q PONG"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 5s
+
+x-healthcheck-5002: &healthcheck-5002
+  test: ["CMD-SHELL", "printf 'PING\nQUIT\n' | kv-cli 127.0.0.1 5002 | grep -q PONG"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 5s
+
+services:
+  standalone:
+    <<: *kvstore-base
+    profiles: ["standalone"]
+    command: ["kvstore", "serve", "5000"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - standalone-data:/data
+    healthcheck: *healthcheck-5000
+
+  shard-0:
+    <<: *kvstore-base
+    profiles: ["cluster"]
+    command: ["kvstore", "serve-cluster", "5000", "2", "0", "1=shard-1:5001"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - shard-0-data:/data
+    healthcheck: *healthcheck-5000
+
+  shard-1:
+    <<: *kvstore-base
+    profiles: ["cluster"]
+    command: ["kvstore", "serve-cluster", "5001", "2", "1", "0=shard-0:5000"]
+    ports:
+      - "5001:5001"
+    volumes:
+      - shard-1-data:/data
+    healthcheck: *healthcheck-5001
+
+  raft-follower-1:
+    <<: *kvstore-base
+    profiles: ["raft"]
+    command:
+      [
+        "kvstore",
+        "serve-follower",
+        "5001",
+        "raft-follower-2:5002",
+        "raft-leader:5000"
+      ]
+    ports:
+      - "5001:5001"
+    volumes:
+      - raft-follower-1-data:/data
+    healthcheck: *healthcheck-5001
+
+  raft-follower-2:
+    <<: *kvstore-base
+    profiles: ["raft"]
+    command:
+      [
+        "kvstore",
+        "serve-follower",
+        "5002",
+        "raft-follower-1:5001",
+        "raft-leader:5000"
+      ]
+    ports:
+      - "5002:5002"
+    volumes:
+      - raft-follower-2-data:/data
+    healthcheck: *healthcheck-5002
+
+  raft-leader:
+    <<: *kvstore-base
+    profiles: ["raft"]
+    command:
+      [
+        "kvstore",
+        "serve-leader",
+        "5000",
+        "raft-follower-1:5001",
+        "raft-follower-2:5002"
+      ]
+    depends_on:
+      raft-follower-1:
+        condition: service_healthy
+      raft-follower-2:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    volumes:
+      - raft-leader-data:/data
+    healthcheck: *healthcheck-5000
+
+volumes:
+  standalone-data:
+  shard-0-data:
+  shard-1-data:
+  raft-leader-data:
+  raft-follower-1-data:
+  raft-follower-2-data:

@@ -9,6 +9,7 @@ enum class CommandType {
     Get,
     Del,
     Exists,
+    Ping,
     Metrics,
     ClusterInfo,
     ClusterNodes,

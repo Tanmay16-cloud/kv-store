@@ -67,6 +67,10 @@ std::uint64_t RaftState::LastApplied() const {
     return last_applied_;
 }
 
+std::optional<std::string> RaftState::KnownLeaderId() const {
+    return known_leader_id_;
+}
+
 PersistentState RaftState::DurableState() const {
     return PersistentState{current_term_, voted_for_, log_};
 }
@@ -75,11 +79,19 @@ std::uint64_t RaftState::StartElection() {
     ++current_term_;
     role_ = NodeRole::Candidate;
     voted_for_ = node_id_;
+    known_leader_id_.reset();
     return current_term_;
 }
 
 void RaftState::BecomeLeader() {
     role_ = NodeRole::Leader;
+    known_leader_id_ = node_id_;
+}
+
+void RaftState::ObserveTerm(std::uint64_t term) {
+    if (term > current_term_) {
+        StepDownToFollower(term);
+    }
 }
 
 void RaftState::RestorePersistentState(const PersistentState& state) {
@@ -87,6 +99,7 @@ void RaftState::RestorePersistentState(const PersistentState& state) {
     voted_for_ = state.voted_for;
     log_ = state.log;
     role_ = NodeRole::Follower;
+    known_leader_id_.reset();
     commit_index_ = 0;
     last_applied_ = 0;
 }
@@ -122,6 +135,7 @@ VoteResponse RaftState::HandleVoteRequest(const VoteRequest& request) {
 
     voted_for_ = request.candidate_id;
     role_ = NodeRole::Follower;
+    known_leader_id_.reset();
     return {current_term_, true};
 }
 
@@ -136,6 +150,7 @@ HeartbeatResponse RaftState::HandleHeartbeat(const HeartbeatRequest& request) {
         role_ = NodeRole::Follower;
     }
 
+    known_leader_id_ = request.leader_id;
     return {current_term_, true};
 }
 
@@ -149,6 +164,8 @@ AppendEntriesResponse RaftState::HandleAppendEntries(const AppendEntriesRequest&
     } else {
         role_ = NodeRole::Follower;
     }
+
+    known_leader_id_ = request.leader_id;
 
     if (request.previous_log_index > LastLogIndex()) {
         return {current_term_, false, LastLogIndex()};
@@ -209,6 +226,7 @@ void RaftState::StepDownToFollower(std::uint64_t term) {
     current_term_ = term;
     role_ = NodeRole::Follower;
     voted_for_.reset();
+    known_leader_id_.reset();
 }
 
 }  // namespace kvstore::raft

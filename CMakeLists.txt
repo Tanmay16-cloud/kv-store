@@ -10,6 +10,28 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+add_library(kvstore_net
+    src/net/socket.cpp
+)
+
+target_include_directories(kvstore_net
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(kvstore_net PUBLIC cxx_std_20)
+
+if(WIN32)
+    target_compile_definitions(kvstore_net PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(kvstore_net PUBLIC ws2_32)
+endif()
+
+if(MSVC)
+    target_compile_options(kvstore_net PRIVATE /W4)
+else()
+    target_compile_options(kvstore_net PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(kvstore_core
     src/cluster/cluster_metadata.cpp
     src/metrics/server_metrics.cpp
@@ -28,6 +50,8 @@ target_include_directories(kvstore_core
 )
 
 target_compile_features(kvstore_core PUBLIC cxx_std_20)
+
+target_link_libraries(kvstore_core PUBLIC kvstore_net)
 
 if(WIN32)
     target_compile_definitions(kvstore_core PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -51,6 +75,7 @@ add_executable(kv-cli
 )
 
 target_compile_features(kv-cli PRIVATE cxx_std_20)
+target_link_libraries(kv-cli PRIVATE kvstore_net)
 
 if(WIN32)
     target_compile_definitions(kv-cli PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -62,6 +87,7 @@ add_executable(kv-bench
 )
 
 target_compile_features(kv-bench PRIVATE cxx_std_20)
+target_link_libraries(kv-bench PRIVATE kvstore_net)
 
 if(WIN32)
     target_compile_definitions(kv-bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

@@ -76,10 +76,12 @@ public:
     std::optional<LogEntry> LogEntryAt(std::uint64_t index) const;
     std::uint64_t CommitIndex() const;
     std::uint64_t LastApplied() const;
+    std::optional<std::string> KnownLeaderId() const;
     PersistentState DurableState() const;
 
     std::uint64_t StartElection();
     void BecomeLeader();
+    void ObserveTerm(std::uint64_t term);
     void RestorePersistentState(const PersistentState& state);
     LogEntry AppendLeaderEntry(const protocol::Command& command);
     bool TruncateUncommittedFrom(std::uint64_t index);
@@ -95,6 +97,7 @@ private:
     std::uint64_t current_term_{0};
     NodeRole role_{NodeRole::Follower};
     std::optional<std::string> voted_for_;
+    std::optional<std::string> known_leader_id_;
     std::vector<LogEntry> log_;
     std::uint64_t commit_index_{0};
     std::uint64_t last_applied_{0};

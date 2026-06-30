@@ -77,7 +77,7 @@ std::optional<kvstore::cluster::ClusterNode> ParseShardNodeMapping(const std::st
 void PrintUsage() {
     std::cerr << "Usage:\n";
     std::cerr << "  kvstore serve [port]\n";
-    std::cerr << "  kvstore serve-follower <port>\n";
+    std::cerr << "  kvstore serve-follower <port> [peer_host:peer_port ...]\n";
     std::cerr << "  kvstore serve-leader <port> [follower_host:follower_port ...]\n";
     std::cerr << "  kvstore serve-cluster <port> <shard_count> <local_shard_id>"
                  " [shard_id=host:port ...]\n";
@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (mode == "serve-follower") {
-            if (argc != 3) {
+            if (argc < 3) {
                 PrintUsage();
                 return 1;
             }
@@ -115,7 +115,19 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            kvstore::server::TcpServer server(port.value(), kvstore::server::ServerRole::Follower, {});
+            std::vector<kvstore::server::FollowerEndpoint> peers;
+            for (int i = 3; i < argc; ++i) {
+                const auto peer = ParseFollowerEndpoint(argv[i]);
+                if (!peer.has_value()) {
+                    PrintUsage();
+                    return 1;
+                }
+                peers.push_back(peer.value());
+            }
+
+            kvstore::server::TcpServer server(port.value(),
+                                              kvstore::server::ServerRole::Follower,
+                                              std::move(peers));
             return server.Run();
         }
 

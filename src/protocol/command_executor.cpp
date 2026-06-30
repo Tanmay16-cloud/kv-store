@@ -26,6 +26,8 @@ CommandResult ExecuteCommand(storage::KeyValueStore& store,
             return {store.Delete(command.key) ? "1" : "0", false};
         case CommandType::Exists:
             return {store.Exists(command.key) ? "1" : "0", false};
+        case CommandType::Ping:
+            return {"PONG", false};
         case CommandType::Metrics:
             if (server_metrics == nullptr) {
                 return {"ERR metrics unavailable", false};

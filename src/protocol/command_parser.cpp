@@ -88,6 +88,14 @@ std::optional<Command> CommandParser::Parse(std::string_view input) {
         return Command{CommandType::Metrics, {}, {}, false};
     }
 
+    if (command == "ping") {
+        if (HasUnexpectedTrailingText(remainder)) {
+            return std::nullopt;
+        }
+
+        return Command{CommandType::Ping, {}, {}, false};
+    }
+
     if (command == "cluster") {
         const auto [subcommand_token, subcommand_remainder] = SplitFirstToken(remainder);
         if (subcommand_token.empty()) {

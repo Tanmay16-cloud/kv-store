@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -50,6 +51,7 @@ private:
     persistence::WriteAheadLog wal_;
     persistence::RaftMetadataStore raft_metadata_;
     std::mutex execution_mutex_;
+    std::chrono::steady_clock::time_point last_leader_contact_;
     std::size_t writes_since_compaction_{0};
 };
 

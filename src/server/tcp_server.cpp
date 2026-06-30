@@ -1,10 +1,8 @@
 #include "kvstore/server/tcp_server.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -14,82 +12,18 @@
 #include <utility>
 #include <vector>
 
+#include "kvstore/net/socket.h"
 #include "kvstore/persistence/raft_metadata_store.h"
 #include "kvstore/protocol/command.h"
 #include "kvstore/protocol/command_executor.h"
 #include "kvstore/protocol/command_parser.h"
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
-
 namespace kvstore::server {
 namespace {
 
-#ifdef _WIN32
-
 constexpr std::chrono::milliseconds kHeartbeatInterval{1000};
-
-class WinsockSession {
-public:
-    WinsockSession() {
-        ok_ = WSAStartup(MAKEWORD(2, 2), &data_) == 0;
-    }
-
-    ~WinsockSession() {
-        if (ok_) {
-            WSACleanup();
-        }
-    }
-
-    bool Ok() const {
-        return ok_;
-    }
-
-private:
-    WSADATA data_{};
-    bool ok_{false};
-};
-
-bool SendLine(SOCKET client, const std::string& line) {
-    std::string response = line + "\n";
-    const char* data = response.data();
-    int remaining = static_cast<int>(response.size());
-
-    while (remaining > 0) {
-        const int sent = send(client, data, remaining, 0);
-        if (sent == SOCKET_ERROR) {
-            return false;
-        }
-
-        data += sent;
-        remaining -= sent;
-    }
-
-    return true;
-}
-
-bool ReceiveLine(SOCKET socket, std::string& pending, std::string& line) {
-    while (true) {
-        const std::size_t newline = pending.find('\n');
-        if (newline != std::string::npos) {
-            line = pending.substr(0, newline);
-            pending.erase(0, newline + 1);
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            return true;
-        }
-
-        std::array<char, 4096> buffer{};
-        const int received = recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
-        if (received <= 0) {
-            return false;
-        }
-        pending.append(buffer.data(), static_cast<std::size_t>(received));
-    }
-}
+constexpr std::chrono::milliseconds kElectionPollInterval{200};
+constexpr std::chrono::milliseconds kBaseElectionTimeout{2500};
 
 std::string TrimLeft(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -136,6 +70,42 @@ std::string BuildMovedResponse(const cluster::ClusterMetadata& cluster_metadata,
            std::to_string(owner->port);
 }
 
+std::string NodeIdForPort(std::uint16_t port) {
+    return "node-" + std::to_string(port);
+}
+
+std::optional<FollowerEndpoint> EndpointForNodeId(const std::vector<FollowerEndpoint>& peers,
+                                                  std::uint16_t local_port,
+                                                  const std::string& node_id) {
+    if (node_id == NodeIdForPort(local_port)) {
+        return FollowerEndpoint{"127.0.0.1", local_port};
+    }
+
+    for (const auto& peer : peers) {
+        if (node_id == NodeIdForPort(peer.port)) {
+            return peer;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::string BuildNotLeaderResponse(const std::vector<FollowerEndpoint>& peers,
+                                   std::uint16_t local_port,
+                                   const raft::RaftState& raft_state) {
+    const auto leader_id = raft_state.KnownLeaderId();
+    if (!leader_id.has_value()) {
+        return "ERR node is not raft leader";
+    }
+
+    const auto endpoint = EndpointForNodeId(peers, local_port, leader_id.value());
+    if (!endpoint.has_value()) {
+        return "ERR node is not raft leader";
+    }
+
+    return "NOT_LEADER " + endpoint->host + ":" + std::to_string(endpoint->port);
+}
+
 bool SaveRaftMetadata(persistence::RaftMetadataStore& raft_metadata,
                       const raft::RaftState& raft_state) {
     return raft_metadata.Save(raft_state.DurableState());
@@ -172,6 +142,7 @@ std::optional<std::string> TryHandleRaftMessage(raft::RaftState& raft_state,
                                                 persistence::WriteAheadLog& wal,
                                                 std::size_t& writes_since_compaction,
                                                 std::size_t compaction_threshold,
+                                                std::chrono::steady_clock::time_point& last_leader_contact,
                                                 const std::string& line) {
     std::istringstream input(line);
     std::string prefix;
@@ -206,6 +177,9 @@ std::optional<std::string> TryHandleRaftMessage(raft::RaftState& raft_state,
         if (!SaveRaftMetadata(raft_metadata, raft_state)) {
             return std::string("ERR failed to persist raft metadata");
         }
+        if (response.vote_granted) {
+            last_leader_contact = std::chrono::steady_clock::now();
+        }
 
         return std::string("VOTE ") + std::to_string(response.term) +
                (response.vote_granted ? " GRANTED" : " DENIED");
@@ -219,6 +193,9 @@ std::optional<std::string> TryHandleRaftMessage(raft::RaftState& raft_state,
         const auto response = raft_state.HandleHeartbeat(raft::HeartbeatRequest{term.value(), node_id});
         if (!SaveRaftMetadata(raft_metadata, raft_state)) {
             return std::string("ERR failed to persist raft metadata");
+        }
+        if (response.accepted) {
+            last_leader_contact = std::chrono::steady_clock::now();
         }
 
         return std::string("HEARTBEAT ") + std::to_string(response.term) +
@@ -264,12 +241,13 @@ std::optional<std::string> TryHandleRaftMessage(raft::RaftState& raft_state,
         }
 
         if (response.success) {
-        const auto commands = raft_state.MarkCommitted(raft_state.CommitIndex());
-        if (!ApplyCommittedCommands(store, wal, commands, writes_since_compaction,
-                                    compaction_threshold)) {
-            metrics.RecordError();
-            return std::string("ERR failed to apply raft commit");
-        }
+            last_leader_contact = std::chrono::steady_clock::now();
+            const auto commands = raft_state.MarkCommitted(raft_state.CommitIndex());
+            if (!ApplyCommittedCommands(store, wal, commands, writes_since_compaction,
+                                        compaction_threshold)) {
+                metrics.RecordError();
+                return std::string("ERR failed to apply raft commit");
+            }
         }
 
         return std::string("APPEND ") + std::to_string(response.term) + " " +
@@ -297,6 +275,7 @@ std::optional<std::string> TryHandleRaftMessage(raft::RaftState& raft_state,
             return std::string("COMMIT ") + std::to_string(heartbeat.term) + " " +
                    std::to_string(raft_state.LastApplied()) + " STALE";
         }
+        last_leader_contact = std::chrono::steady_clock::now();
 
         const auto commands = raft_state.MarkCommitted(commit_index.value());
         if (!ApplyCommittedCommands(store, wal, commands, writes_since_compaction,
@@ -322,53 +301,60 @@ std::string ToCommandLine(const protocol::Command& command) {
     return {};
 }
 
-SOCKET ConnectToEndpoint(const FollowerEndpoint& follower) {
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    addrinfo* resolved = nullptr;
-    const std::string port_text = std::to_string(follower.port);
-    if (getaddrinfo(follower.host.c_str(), port_text.c_str(), &hints, &resolved) != 0) {
-        return INVALID_SOCKET;
-    }
-
-    SOCKET connected_socket = INVALID_SOCKET;
-    for (addrinfo* candidate = resolved; candidate != nullptr; candidate = candidate->ai_next) {
-        connected_socket = socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
-        if (connected_socket == INVALID_SOCKET) {
-            continue;
-        }
-
-        if (connect(connected_socket, candidate->ai_addr, static_cast<int>(candidate->ai_addrlen)) == 0) {
-            break;
-        }
-
-        closesocket(connected_socket);
-        connected_socket = INVALID_SOCKET;
-    }
-
-    freeaddrinfo(resolved);
-
-    return connected_socket;
+net::SocketHandle ConnectToEndpoint(const FollowerEndpoint& follower) {
+    return net::ConnectTcp(follower.host, follower.port);
 }
 
 bool SendRequestToEndpoint(const FollowerEndpoint& follower,
                            const std::string& request,
                            std::string& response) {
-    const SOCKET socket_to_follower = ConnectToEndpoint(follower);
-    if (socket_to_follower == INVALID_SOCKET) {
+    const net::SocketHandle socket_to_follower = ConnectToEndpoint(follower);
+    if (socket_to_follower == net::kInvalidSocket) {
         return false;
     }
 
     std::string pending;
-    const bool ok = ReceiveLine(socket_to_follower, pending, response) &&
-                    SendLine(socket_to_follower, request) &&
-                    ReceiveLine(socket_to_follower, pending, response);
+    const bool ok = net::ReceiveLine(socket_to_follower, pending, response) &&
+                    net::SendLine(socket_to_follower, request) &&
+                    net::ReceiveLine(socket_to_follower, pending, response);
 
-    closesocket(socket_to_follower);
+    net::CloseSocket(socket_to_follower);
     return ok;
+}
+
+struct VotePeerResult {
+    bool reachable{false};
+    bool granted{false};
+    std::uint64_t term{0};
+};
+
+VotePeerResult ParseVotePeerResponse(const std::string& response) {
+    std::istringstream input(response);
+    std::string kind;
+    std::string term_text;
+    std::string status;
+    std::string trailing;
+
+    input >> kind >> term_text >> status;
+    const auto term = ParseUint64(term_text);
+    if (kind != "VOTE" || !term.has_value() || (input >> trailing)) {
+        return {};
+    }
+
+    return {true, status == "GRANTED", term.value()};
+}
+
+VotePeerResult RequestVoteFromPeer(const FollowerEndpoint& peer,
+                                   const std::string& candidate_id,
+                                   std::uint64_t term) {
+    std::string response;
+    const std::string request =
+        "RAFT VOTE " + std::to_string(term) + " " + candidate_id;
+    if (!SendRequestToEndpoint(peer, request, response)) {
+        return {};
+    }
+
+    return ParseVotePeerResponse(response);
 }
 
 struct AppendFollowerResult {
@@ -531,9 +517,85 @@ void HeartbeatLoop(const std::vector<FollowerEndpoint>& followers,
     }
 }
 
-void HandleClient(SOCKET client,
+void ElectionLoop(const std::vector<FollowerEndpoint>& peers,
+                  raft::RaftState& raft_state,
+                  persistence::RaftMetadataStore& raft_metadata,
+                  std::mutex& execution_mutex,
+                  std::chrono::steady_clock::time_point& last_leader_contact,
+                  std::uint16_t local_port) {
+    if (peers.empty()) {
+        return;
+    }
+
+    const auto election_timeout =
+        kBaseElectionTimeout + std::chrono::milliseconds((local_port % 10) * 1000);
+
+    while (true) {
+        std::this_thread::sleep_for(kElectionPollInterval);
+
+        std::string candidate_id;
+        std::uint64_t election_term = 0;
+        {
+            std::lock_guard lock(execution_mutex);
+            if (raft_state.Role() == raft::NodeRole::Leader) {
+                continue;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_leader_contact < election_timeout) {
+                continue;
+            }
+
+            election_term = raft_state.StartElection();
+            candidate_id = raft_state.NodeId();
+            last_leader_contact = now;
+            if (!SaveRaftMetadata(raft_metadata, raft_state)) {
+                std::cerr << "Failed to persist Raft election metadata.\n";
+                continue;
+            }
+        }
+
+        std::size_t votes = 1;
+        std::uint64_t highest_term = election_term;
+        for (const auto& peer : peers) {
+            const auto response = RequestVoteFromPeer(peer, candidate_id, election_term);
+            if (!response.reachable) {
+                continue;
+            }
+            highest_term = std::max(highest_term, response.term);
+            if (response.term == election_term && response.granted) {
+                ++votes;
+            }
+        }
+
+        const auto cluster_size = peers.size() + 1;
+        const auto majority = (cluster_size / 2) + 1;
+        {
+            std::lock_guard lock(execution_mutex);
+            if (highest_term > raft_state.CurrentTerm()) {
+                raft_state.ObserveTerm(highest_term);
+                SaveRaftMetadata(raft_metadata, raft_state);
+                last_leader_contact = std::chrono::steady_clock::now();
+                continue;
+            }
+
+            if (raft_state.Role() == raft::NodeRole::Candidate &&
+                raft_state.CurrentTerm() == election_term && votes >= majority) {
+                raft_state.BecomeLeader();
+                if (!SaveRaftMetadata(raft_metadata, raft_state)) {
+                    std::cerr << "Failed to persist Raft leader metadata after election.\n";
+                }
+                std::cout << "Raft node " << candidate_id << " became leader for term "
+                          << election_term << ".\n";
+            }
+        }
+    }
+}
+
+void HandleClient(net::SocketHandle client,
                   ServerRole role,
                   const std::vector<FollowerEndpoint>& followers,
+                  std::uint16_t local_port,
                   raft::RaftState& raft_state,
                   const std::optional<cluster::ClusterMetadata>& cluster_metadata,
                   metrics::ServerMetrics& metrics,
@@ -541,163 +603,149 @@ void HandleClient(SOCKET client,
                   storage::KeyValueStore& store,
                   persistence::WriteAheadLog& wal,
                   std::mutex& execution_mutex,
+                  std::chrono::steady_clock::time_point& last_leader_contact,
                   std::size_t& writes_since_compaction,
                   std::size_t compaction_threshold) {
-    const auto close_client = [&metrics](SOCKET socket) {
-        closesocket(socket);
+    const auto close_client = [&metrics](net::SocketHandle socket) {
+        net::CloseSocket(socket);
         metrics.RecordConnectionClosed();
     };
 
-    std::array<char, 4096> buffer{};
     std::string pending;
 
     metrics.RecordConnectionOpened();
-    SendLine(client, "OK connected to kvstore");
+    net::SendLine(client, "OK connected to kvstore");
 
     while (true) {
-        const int bytes_received = recv(client, buffer.data(), static_cast<int>(buffer.size()), 0);
-        if (bytes_received <= 0) {
+        std::string line;
+        if (!net::ReceiveLine(client, pending, line)) {
             break;
         }
 
-        pending.append(buffer.data(), static_cast<std::size_t>(bytes_received));
+        std::optional<std::string> raft_response;
+        {
+            std::lock_guard lock(execution_mutex);
+            raft_response = TryHandleRaftMessage(raft_state,
+                                                 raft_metadata,
+                                                 metrics,
+                                                 store,
+                                                 wal,
+                                                 writes_since_compaction,
+                                                 compaction_threshold,
+                                                 last_leader_contact,
+                                                 line);
+        }
+        if (raft_response.has_value()) {
+            if (!net::SendLine(client, raft_response.value())) {
+                close_client(client);
+                return;
+            }
+            continue;
+        }
 
-        std::size_t newline = pending.find('\n');
-        while (newline != std::string::npos) {
-            const std::string line = pending.substr(0, newline);
-            pending.erase(0, newline + 1);
-
-            std::optional<std::string> raft_response;
+        const auto parsed = protocol::CommandParser::Parse(line);
+        if (!parsed.has_value()) {
+            metrics.RecordError();
+            if (!net::SendLine(client, "ERR invalid command")) {
+                close_client(client);
+                return;
+            }
+        } else {
+            protocol::CommandResult result;
             {
                 std::lock_guard lock(execution_mutex);
-                raft_response = TryHandleRaftMessage(raft_state,
-                                                     raft_metadata,
-                                                     metrics,
-                                                     store,
-                                                     wal,
-                                                     writes_since_compaction,
-                                                     compaction_threshold,
-                                                     line);
-            }
-            if (raft_response.has_value()) {
-                if (!SendLine(client, raft_response.value())) {
-                    close_client(client);
-                    return;
+                const bool is_write = IsMutatingCommand(parsed->type);
+                const bool is_key_command = IsKeyCommand(parsed->type);
+                metrics.RecordCommandHandled();
+                if (is_write) {
+                    metrics.RecordWriteCommand();
+                } else if (is_key_command) {
+                    metrics.RecordReadCommand();
                 }
-                newline = pending.find('\n');
-                continue;
-            }
-
-            const auto parsed = protocol::CommandParser::Parse(line);
-            if (!parsed.has_value()) {
-                metrics.RecordError();
-                if (!SendLine(client, "ERR invalid command")) {
-                    close_client(client);
-                    return;
-                }
-            } else {
-                protocol::CommandResult result;
-                {
-                    std::lock_guard lock(execution_mutex);
-                    const bool is_write = IsMutatingCommand(parsed->type);
-                    const bool is_key_command = IsKeyCommand(parsed->type);
-                    metrics.RecordCommandHandled();
-                    if (is_write) {
-                        metrics.RecordWriteCommand();
-                    } else if (is_key_command) {
-                        metrics.RecordReadCommand();
-                    }
-                    if (IsClusterCommand(parsed->type)) {
-                        result = protocol::ExecuteCommand(store,
-                                                          parsed.value(),
-                                                          nullptr,
-                                                          cluster_metadata ? &cluster_metadata.value()
-                                                                           : nullptr,
-                                                          &metrics);
-                    } else if (cluster_metadata.has_value() && is_key_command &&
-                               !parsed->is_replicated &&
-                               !cluster_metadata->OwnsKey(parsed->key)) {
-                        metrics.RecordClusterRedirect();
-                        result = {BuildMovedResponse(cluster_metadata.value(), parsed->key), false};
-                    } else if (role == ServerRole::Follower && is_write && !parsed->is_replicated) {
-                        result = {"ERR follower is read-only", false};
-                    } else if (role == ServerRole::Leader && is_write && !parsed->is_replicated &&
-                               raft_state.Role() != raft::NodeRole::Leader) {
-                        result = {"ERR node is not raft leader", false};
-                    } else if (role == ServerRole::Leader && is_write && !parsed->is_replicated) {
-                        const auto entry = raft_state.AppendLeaderEntry(parsed.value());
-                        if (!SaveRaftMetadata(raft_metadata, raft_state)) {
-                            raft_state.TruncateUncommittedFrom(entry.index);
-                            result = {"ERR failed to persist raft metadata", false};
-                        } else {
-                            const auto acknowledgements = AppendEntryToFollowers(followers,
-                                                                                 raft_state.NodeId(),
-                                                                                 raft_state,
-                                                                                 entry);
-                            const auto cluster_size = followers.size() + 1;
-                            const auto majority = (cluster_size / 2) + 1;
-                            if (acknowledgements < majority) {
-                                raft_state.TruncateUncommittedFrom(entry.index);
-                                SaveRaftMetadata(raft_metadata, raft_state);
-                                result = {"ERR replication failed", false};
-                            } else {
-                                std::string applied_response;
-                                const auto commands = raft_state.MarkCommitted(entry.index);
-                                if (!ApplyCommittedCommands(store,
-                                                            wal,
-                                                            commands,
-                                                            writes_since_compaction,
-                                                            compaction_threshold,
-                                                            &applied_response)) {
-                                    result = {"ERR failed to persist command", false};
-                                } else {
-                                    CommitEntryOnFollowers(followers,
-                                                           raft_state.NodeId(),
-                                                           entry.term,
-                                                           entry.index);
-                                    result = {applied_response.empty() ? "OK" : applied_response,
-                                              false};
-                                }
-                            }
-                        }
+                if (IsClusterCommand(parsed->type)) {
+                    result = protocol::ExecuteCommand(store,
+                                                      parsed.value(),
+                                                      nullptr,
+                                                      cluster_metadata ? &cluster_metadata.value()
+                                                                       : nullptr,
+                                                      &metrics);
+                } else if (cluster_metadata.has_value() && is_key_command &&
+                           !parsed->is_replicated &&
+                           !cluster_metadata->OwnsKey(parsed->key)) {
+                    metrics.RecordClusterRedirect();
+                    result = {BuildMovedResponse(cluster_metadata.value(), parsed->key), false};
+                } else if (role != ServerRole::Standalone && is_write && !parsed->is_replicated &&
+                           raft_state.Role() != raft::NodeRole::Leader) {
+                    result = {BuildNotLeaderResponse(followers, local_port, raft_state), false};
+                } else if (role != ServerRole::Standalone && is_write && !parsed->is_replicated) {
+                    const auto entry = raft_state.AppendLeaderEntry(parsed.value());
+                    if (!SaveRaftMetadata(raft_metadata, raft_state)) {
+                        raft_state.TruncateUncommittedFrom(entry.index);
+                        result = {"ERR failed to persist raft metadata", false};
                     } else {
-                        result = protocol::ExecuteCommand(store,
-                                                          parsed.value(),
-                                                          &wal,
-                                                          cluster_metadata ? &cluster_metadata.value()
-                                                                           : nullptr,
-                                                          &metrics);
-                        if (result.response != "ERR failed to persist command" && is_write) {
-                            ++writes_since_compaction;
-                            if (writes_since_compaction >= compaction_threshold && wal.Compact(store)) {
-                                writes_since_compaction = 0;
+                        const auto acknowledgements = AppendEntryToFollowers(followers,
+                                                                             raft_state.NodeId(),
+                                                                             raft_state,
+                                                                             entry);
+                        const auto cluster_size = followers.size() + 1;
+                        const auto majority = (cluster_size / 2) + 1;
+                        if (acknowledgements < majority) {
+                            raft_state.TruncateUncommittedFrom(entry.index);
+                            SaveRaftMetadata(raft_metadata, raft_state);
+                            result = {"ERR replication failed", false};
+                        } else {
+                            std::string applied_response;
+                            const auto commands = raft_state.MarkCommitted(entry.index);
+                            if (!ApplyCommittedCommands(store,
+                                                        wal,
+                                                        commands,
+                                                        writes_since_compaction,
+                                                        compaction_threshold,
+                                                        &applied_response)) {
+                                result = {"ERR failed to persist command", false};
+                            } else {
+                                CommitEntryOnFollowers(followers,
+                                                       raft_state.NodeId(),
+                                                       entry.term,
+                                                       entry.index);
+                                result = {applied_response.empty() ? "OK" : applied_response,
+                                          false};
                             }
                         }
                     }
-
-                    if (result.response.rfind("ERR", 0) == 0) {
-                        metrics.RecordError();
+                } else {
+                    result = protocol::ExecuteCommand(store,
+                                                      parsed.value(),
+                                                      &wal,
+                                                      cluster_metadata ? &cluster_metadata.value()
+                                                                       : nullptr,
+                                                      &metrics);
+                    if (result.response != "ERR failed to persist command" && is_write) {
+                        ++writes_since_compaction;
+                        if (writes_since_compaction >= compaction_threshold && wal.Compact(store)) {
+                            writes_since_compaction = 0;
+                        }
                     }
                 }
 
-                if (!SendLine(client, result.response)) {
-                    close_client(client);
-                    return;
-                }
-                if (result.should_close) {
-                    close_client(client);
-                    return;
+                if (result.response.rfind("ERR", 0) == 0) {
+                    metrics.RecordError();
                 }
             }
 
-            newline = pending.find('\n');
+            if (!net::SendLine(client, result.response)) {
+                close_client(client);
+                return;
+            }
+            if (result.should_close) {
+                close_client(client);
+                return;
+            }
         }
     }
 
     close_client(client);
 }
-
-#endif
 
 }  // namespace
 
@@ -715,13 +763,10 @@ TcpServer::TcpServer(std::uint16_t port,
       cluster_metadata_(std::move(cluster_metadata)),
       wal_("kvstore-" + std::to_string(port) + ".wal",
            "kvstore-" + std::to_string(port) + ".snapshot"),
-      raft_metadata_("kvstore-" + std::to_string(port) + ".raft") {}
+      raft_metadata_("kvstore-" + std::to_string(port) + ".raft"),
+      last_leader_contact_(std::chrono::steady_clock::now()) {}
 
 int TcpServer::Run() {
-#ifndef _WIN32
-    std::cerr << "TCP server is currently implemented for Windows using WinSock.\n";
-    return 1;
-#else
     if (!wal_.Replay(store_)) {
         std::cerr << "Failed to replay persistence files.\n";
         return 1;
@@ -732,32 +777,15 @@ int TcpServer::Run() {
         return 1;
     }
 
-    WinsockSession winsock;
-    if (!winsock.Ok()) {
-        std::cerr << "Failed to initialize WinSock.\n";
+    net::SocketRuntime socket_runtime;
+    if (!socket_runtime.Ok()) {
+        std::cerr << "Failed to initialize socket runtime.\n";
         return 1;
     }
 
-    const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listener == INVALID_SOCKET) {
-        std::cerr << "Failed to create server socket.\n";
-        return 1;
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(port_);
-
-    if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
-        std::cerr << "Failed to bind TCP server to port " << port_ << ".\n";
-        closesocket(listener);
-        return 1;
-    }
-
-    if (listen(listener, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "Failed to listen for TCP clients.\n";
-        closesocket(listener);
+    const net::SocketHandle listener = net::ListenTcp(port_);
+    if (listener == net::kInvalidSocket) {
+        std::cerr << "Failed to listen for TCP clients on port " << port_ << ".\n";
         return 1;
     }
 
@@ -771,19 +799,30 @@ int TcpServer::Run() {
                 return 1;
             }
         }
+    }
 
+    if (role_ != ServerRole::Standalone) {
         std::thread heartbeat_thread(HeartbeatLoop,
                                      std::cref(followers_),
                                      std::ref(raft_state_),
                                      std::ref(execution_mutex_));
         heartbeat_thread.detach();
+
+        std::thread election_thread(ElectionLoop,
+                                    std::cref(followers_),
+                                    std::ref(raft_state_),
+                                    std::ref(raft_metadata_),
+                                    std::ref(execution_mutex_),
+                                    std::ref(last_leader_contact_),
+                                    port_);
+        election_thread.detach();
     }
 
     std::cout << "KV TCP server listening on port " << port_ << ".\n";
 
     while (true) {
-        SOCKET client = accept(listener, nullptr, nullptr);
-        if (client == INVALID_SOCKET) {
+        const net::SocketHandle client = net::AcceptTcp(listener);
+        if (client == net::kInvalidSocket) {
             std::cerr << "Failed to accept client connection.\n";
             continue;
         }
@@ -792,6 +831,7 @@ int TcpServer::Run() {
                                   client,
                                   role_,
                                   std::cref(followers_),
+                                  port_,
                                   std::ref(raft_state_),
                                   std::cref(cluster_metadata_),
                                   std::ref(metrics_),
@@ -799,14 +839,14 @@ int TcpServer::Run() {
                                   std::ref(store_),
                                   std::ref(wal_),
                                   std::ref(execution_mutex_),
+                                  std::ref(last_leader_contact_),
                                   std::ref(writes_since_compaction_),
                                   kCompactionThreshold);
         client_thread.detach();
     }
 
-    closesocket(listener);
+    net::CloseSocket(listener);
     return 0;
-#endif
 }
 
 }  // namespace kvstore::server

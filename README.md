@@ -8,24 +8,30 @@ leader election, log replication, cluster metadata, and benchmarking.
 
 ## Current Milestone
 
-Milestone 13 adds runtime metrics and a simple benchmark client on top of the
-existing shard-aware Raft-backed store:
+Milestone 15 completes the learning-project roadmap with health checks and
+client-side shard rerouting on top of the Docker-capable distributed store:
 
 - CMake-based C++20 project
 - Thread-safe in-memory key-value store
 - Line-based command parser for `SET`, `GET`, `DEL`, `EXISTS`, `QUIT`, and legacy internal `REPL` writes
 - Shared command executor used by console, TCP, and replication paths
-- Windows TCP server and CLI client using WinSock
+- Portable TCP server, CLI client, and benchmark client using WinSock on Windows
+  and POSIX sockets on Linux/macOS
+- `PING` returns `PONG` for readiness and health checks
 - WAL plus snapshot compaction per server port
 - Raft metadata persistence per server port in `.raft` files
 - Cluster metadata tracks shard ownership and node endpoints
 - `CLUSTER INFO`, `CLUSTER NODES`, and `CLUSTER KEY <key>` expose the shard map to clients
 - `serve-cluster` mode routes keys to local shards and returns `MOVED <shard> <host:port>` for non-local keys
+- `kv-cli` and `kv-bench` automatically follow one `MOVED` redirect per command
 - `METRICS` exposes server-side counters such as connections, commands, redirects, Raft messages, and errors
 - `kv-bench` can measure basic `SET`, `GET`, and mixed workloads against a running server
+- Multi-stage Docker image packages `kvstore`, `kv-cli`, and `kv-bench`
+- Docker Compose profiles launch standalone, sharded, and leader-follower demos with health checks
 - Leader mode stores writes as Raft log entries before applying them
 - Leader mode sends internal `RAFT APPEND` and `RAFT COMMIT` messages to followers
 - Follower mode rejects direct client writes but accepts committed leader log entries
+- Peer-aware followers can start an election and become leader after missed heartbeats
 - Lagging followers can reject a missing previous index and be caught up from earlier leader log entries
 - Raft node state tracks current term, role, voted-for candidate, and durable log entries
 - TCP server can handle internal `RAFT VOTE`, `RAFT HEARTBEAT`, `RAFT APPEND`, and `RAFT COMMIT` messages
@@ -44,6 +50,48 @@ cmake --build build --config Debug
 ```powershell
 ctest --test-dir build -C Debug --output-on-failure
 ```
+
+## Run with Docker
+
+Build the image and start a single-node server:
+
+```powershell
+docker compose --profile standalone up --build
+```
+
+In another terminal, use the CLI or benchmark client inside the running
+container:
+
+```powershell
+docker compose --profile standalone exec standalone kv-cli 127.0.0.1 5000
+docker compose --profile standalone exec standalone kv-bench 127.0.0.1 5000 mixed 1000
+```
+
+Start the two-shard demo:
+
+```powershell
+docker compose --profile cluster up --build
+docker compose --profile cluster exec shard-0 kv-cli 127.0.0.1 5000
+```
+
+The CLI follows `MOVED` redirects automatically, so commands can be sent to any
+shard and retried against the owner by the client.
+
+```powershell
+docker compose --profile cluster exec shard-0 kv-bench 127.0.0.1 5000 mixed 1000
+```
+
+Start the leader-follower demo:
+
+```powershell
+docker compose --profile raft up --build
+docker compose --profile raft exec raft-leader kv-cli 127.0.0.1 5000
+docker compose --profile raft exec raft-follower-1 kv-cli 127.0.0.1 5001
+```
+
+Stop a demo with `docker compose --profile <profile> down`. Add `-v` if you
+want to delete the demo volumes and reset WAL, snapshot, and Raft metadata
+files.
 
 ## Run Single Node
 
@@ -114,6 +162,7 @@ CLUSTER NODES
 CLUSTER KEY profile
 SET profile tanmay
 GET profile
+PING
 QUIT
 ```
 
@@ -123,14 +172,15 @@ If the key belongs to shard `1`, the node on port `5000` responds with something
 MOVED 1 127.0.0.1:5001
 ```
 
-Then connect the client to the reported node and retry the command there.
+The CLI follows that redirect automatically and retries the command once against
+the reported owner.
 
 ## Run Leader-Follower Demo
 
 Terminal 1:
 
 ```powershell
-.\build\Debug\kvstore.exe serve-follower 5001
+.\build\Debug\kvstore.exe serve-follower 5001 127.0.0.1:5000
 ```
 
 Terminal 2:
@@ -189,14 +239,16 @@ VOTE 1 DENIED
 HEARTBEAT 2 OK
 ```
 
-This is not full Raft yet. For simplicity, this milestone models election state transitions, manual vote messages, and leader heartbeats. A production implementation would add randomized election timeouts, automatic vote requests, majority counting, persistent Raft metadata, log freshness checks, and efficient long-lived peer connections.
+Manual vote messages are still useful for inspecting election state transitions.
+Peer-aware followers also run a lightweight automatic election loop when they
+stop hearing from a leader.
 
 ## Try Leader Heartbeats
 
 Terminal 1:
 
 ```powershell
-.\build\Debug\kvstore.exe serve-follower 5001
+.\build\Debug\kvstore.exe serve-follower 5001 127.0.0.1:5000
 ```
 
 Terminal 2:
@@ -207,6 +259,44 @@ Terminal 2:
 
 The leader sends a heartbeat to the follower about once per second. If the follower is stopped or unreachable, the leader prints a heartbeat failure message.
 
+## Try Automatic Leader Failover
+
+Use three server terminals so the remaining followers can still form a majority
+after the leader stops.
+
+Terminal 1:
+
+```powershell
+.\build\Debug\kvstore.exe serve-follower 5001 127.0.0.1:5002 127.0.0.1:5000
+```
+
+Terminal 2:
+
+```powershell
+.\build\Debug\kvstore.exe serve-follower 5002 127.0.0.1:5001 127.0.0.1:5000
+```
+
+Terminal 3:
+
+```powershell
+.\build\Debug\kvstore.exe serve-leader 5000 127.0.0.1:5001 127.0.0.1:5002
+```
+
+Stop the leader on port `5000`. After a few seconds, one follower should print
+that it became leader for a newer term. Connect to the elected follower and send
+a write:
+
+```powershell
+.\build\Debug\kv-cli.exe 127.0.0.1 5001
+SET after-failover yes
+GET after-failover
+QUIT
+```
+
+If port `5001` did not win the election, try port `5002`. This demo now covers
+basic automatic failover, but it still does not include client-side leader
+discovery.
+
 ## Try Follower Catch-Up
 
 Use three server terminals so the leader can still reach a majority if one follower is offline.
@@ -214,13 +304,13 @@ Use three server terminals so the leader can still reach a majority if one follo
 Terminal 1:
 
 ```powershell
-.\build\Debug\kvstore.exe serve-follower 5001
+.\build\Debug\kvstore.exe serve-follower 5001 127.0.0.1:5002 127.0.0.1:5000
 ```
 
 Terminal 2:
 
 ```powershell
-.\build\Debug\kvstore.exe serve-follower 5002
+.\build\Debug\kvstore.exe serve-follower 5002 127.0.0.1:5001 127.0.0.1:5000
 ```
 
 Terminal 3:
@@ -254,7 +344,12 @@ GET after
 QUIT
 ```
 
-This is still a learning-stage distributed store. Raft term, vote, and log entries are persisted, and the cluster layer now knows shard ownership and can redirect clients. A production system would combine this with replicated shard groups, richer membership changes, and automatic client-side rerouting.
+This is a completed learning-stage distributed store. Raft term, vote, and log
+entries are persisted, the cluster layer knows shard ownership, and bundled
+clients can follow shard redirects. A production implementation would still need
+production-grade Raft election hardening, client-side leader discovery, dynamic
+replicated shard groups, richer membership changes, snapshot installation, and
+deeper operational hardening.
 
 ## Roadmap
 
@@ -272,3 +367,4 @@ This is still a learning-stage distributed store. Raft term, vote, and log entri
 12. Sharding and cluster metadata
 13. Metrics and benchmarking
 14. Docker-based demos
+15. Health checks and client-side rerouting
