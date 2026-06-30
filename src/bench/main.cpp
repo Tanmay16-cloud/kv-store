@@ -11,6 +11,8 @@
 
 namespace {
 
+constexpr std::chrono::milliseconds kClientIoTimeout{5000};
+
 struct Endpoint {
     std::string host;
     std::uint16_t port{};
@@ -55,25 +57,43 @@ std::optional<Endpoint> ParseEndpoint(const std::string& text) {
     return Endpoint{text.substr(0, colon), port.value()};
 }
 
-std::optional<Endpoint> ParseMovedResponse(const std::string& response) {
+std::optional<Endpoint> ParseRedirectResponse(const std::string& response) {
     std::istringstream input(response);
     std::string kind;
     std::string shard;
     std::string endpoint_text;
     std::string trailing;
 
-    input >> kind >> shard >> endpoint_text;
-    if (kind != "MOVED" || shard.empty() || endpoint_text.empty() || (input >> trailing)) {
-        return std::nullopt;
+    input >> kind;
+    if (kind == "MOVED") {
+        input >> shard >> endpoint_text;
+        if (shard.empty() || endpoint_text.empty() || (input >> trailing)) {
+            return std::nullopt;
+        }
+        return ParseEndpoint(endpoint_text);
     }
 
-    return ParseEndpoint(endpoint_text);
+    if (kind == "NOT_LEADER") {
+        input >> endpoint_text;
+        if (endpoint_text.empty() || (input >> trailing)) {
+            return std::nullopt;
+        }
+        return ParseEndpoint(endpoint_text);
+    }
+
+    return std::nullopt;
+}
+
+bool IsRedirectToCurrentServer(const Endpoint& redirect, const Endpoint& current_endpoint) {
+    return redirect.host == current_endpoint.host && redirect.port == current_endpoint.port;
 }
 
 bool ConnectTo(Endpoint endpoint,
                kvstore::net::SocketHandle& server,
-               std::string& pending) {
-    const kvstore::net::SocketHandle next = kvstore::net::ConnectTcp(endpoint.host, endpoint.port);
+               std::string& pending,
+               Endpoint& current_endpoint) {
+    const kvstore::net::SocketHandle next =
+        kvstore::net::ConnectTcp(endpoint.host, endpoint.port, kClientIoTimeout);
     if (next == kvstore::net::kInvalidSocket) {
         return false;
     }
@@ -91,11 +111,13 @@ bool ConnectTo(Endpoint endpoint,
 
     server = next;
     pending = std::move(next_pending);
+    current_endpoint = std::move(endpoint);
     return true;
 }
 
 bool RoundTrip(kvstore::net::SocketHandle& server,
                std::string& pending,
+               Endpoint& current_endpoint,
                const std::string& request,
                std::string& response) {
     if (!kvstore::net::SendLine(server, request) ||
@@ -103,12 +125,16 @@ bool RoundTrip(kvstore::net::SocketHandle& server,
         return false;
     }
 
-    const auto redirect = ParseMovedResponse(response);
+    const auto redirect = ParseRedirectResponse(response);
     if (!redirect.has_value()) {
         return true;
     }
 
-    if (!ConnectTo(redirect.value(), server, pending)) {
+    if (IsRedirectToCurrentServer(redirect.value(), current_endpoint)) {
+        return true;
+    }
+
+    if (!ConnectTo(redirect.value(), server, pending, current_endpoint)) {
         return false;
     }
 
@@ -145,8 +171,9 @@ int main(int argc, char* argv[]) {
     }
 
     kvstore::net::SocketHandle server = kvstore::net::kInvalidSocket;
+    Endpoint current_endpoint{argv[1], port.value()};
     std::string pending;
-    if (!ConnectTo(Endpoint{argv[1], port.value()}, server, pending)) {
+    if (!ConnectTo(current_endpoint, server, pending, current_endpoint)) {
         std::cerr << "Failed to connect to " << argv[1] << ':' << port.value() << '\n';
         return 1;
     }
@@ -156,6 +183,7 @@ int main(int argc, char* argv[]) {
         for (std::size_t i = 0; i < operations.value(); ++i) {
             if (!RoundTrip(server,
                            pending,
+                           current_endpoint,
                            "SET bench-" + std::to_string(i) + " value-" + std::to_string(i),
                            response) ||
                 response.rfind("OK", 0) != 0) {
@@ -181,13 +209,14 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (!RoundTrip(server, pending, request, response)) {
+        if (!RoundTrip(server, pending, current_endpoint, request, response)) {
             std::cerr << "Benchmark request failed at operation " << i << ".\n";
             kvstore::net::CloseSocket(server);
             return 1;
         }
 
-        if (response.rfind("ERR", 0) == 0 || response.rfind("MOVED", 0) == 0) {
+        if (response.rfind("ERR", 0) == 0 || response.rfind("MOVED", 0) == 0 ||
+            response.rfind("NOT_LEADER", 0) == 0) {
             std::cerr << "Benchmark stopped after response: " << response << '\n';
             kvstore::net::CloseSocket(server);
             return 1;

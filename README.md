@@ -24,6 +24,7 @@ client-side shard rerouting on top of the Docker-capable distributed store:
 - `CLUSTER INFO`, `CLUSTER NODES`, and `CLUSTER KEY <key>` expose the shard map to clients
 - `serve-cluster` mode routes keys to local shards and returns `MOVED <shard> <host:port>` for non-local keys
 - `kv-cli` and `kv-bench` automatically follow one `MOVED` redirect per command
+- Raft-mode clients can follow `NOT_LEADER <host:port>` redirects after failover
 - `METRICS` exposes server-side counters such as connections, commands, redirects, Raft messages, and errors
 - `kv-bench` can measure basic `SET`, `GET`, and mixed workloads against a running server
 - Multi-stage Docker image packages `kvstore`, `kv-cli`, and `kv-bench`
@@ -283,8 +284,9 @@ Terminal 3:
 ```
 
 Stop the leader on port `5000`. After a few seconds, one follower should print
-that it became leader for a newer term. Connect to the elected follower and send
-a write:
+that it became leader for a newer term. If you connect to the follower that did
+not win, `kv-cli` follows the `NOT_LEADER <host:port>` response to the elected
+leader and retries once:
 
 ```powershell
 .\build\Debug\kv-cli.exe 127.0.0.1 5001
@@ -293,9 +295,8 @@ GET after-failover
 QUIT
 ```
 
-If port `5001` did not win the election, try port `5002`. This demo now covers
-basic automatic failover, but it still does not include client-side leader
-discovery.
+This demo now covers basic automatic failover and client-side leader redirects
+for writes sent to a known follower.
 
 ## Try Follower Catch-Up
 
@@ -327,29 +328,39 @@ SET missed while-down
 QUIT
 ```
 
-Restart the follower on port `5002`, then send another write to the leader:
+While follower `5002` is stopped, send several writes to the leader:
 
 ```powershell
 .\build\Debug\kv-cli.exe 127.0.0.1 5000
-SET after restart
+SET missed-2 while-down-too
 QUIT
 ```
 
-The leader first backfills the missed Raft log entry, then replicates the new one. You can connect to follower `5002` and read both keys:
+Restart the follower on port `5002` with the same peer list. The leader's
+periodic replication heartbeat backfills committed log entries that the follower
+missed while it was offline. After a few seconds, you can connect to follower
+`5002` and read the missed keys without sending another write:
 
 ```powershell
 .\build\Debug\kv-cli.exe 127.0.0.1 5002
 GET missed
-GET after
+GET missed-2
 QUIT
 ```
+
+Persistence files are created per server node, not per client connection. Two
+clients writing through the same server port share that node's files, such as
+`kvstore-5000.wal`, `kvstore-5000.snapshot`, and `kvstore-5000.raft`. A follower
+creates or updates its own files only after it receives and applies replicated
+Raft log entries. If an old leader is restarted after failover, restart it as a
+peer-aware follower so it can rejoin and catch up from the elected leader.
 
 This is a completed learning-stage distributed store. Raft term, vote, and log
 entries are persisted, the cluster layer knows shard ownership, and bundled
 clients can follow shard redirects. A production implementation would still need
-production-grade Raft election hardening, client-side leader discovery, dynamic
-replicated shard groups, richer membership changes, snapshot installation, and
-deeper operational hardening.
+production-grade Raft election hardening, dynamic replicated shard groups,
+richer membership changes, snapshot installation, and deeper operational
+hardening.
 
 ## Roadmap
 

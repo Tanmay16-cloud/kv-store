@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -9,9 +10,12 @@
 #ifdef _WIN32
 #include <ws2tcpip.h>
 #else
+#include <cerrno>
 #include <csignal>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -57,11 +61,116 @@ bool SocketCallFailed(int result) {
 #endif
 }
 
-int ConnectSocket(SocketHandle socket, const addrinfo* address) {
+bool SetSocketBlocking(SocketHandle socket, bool blocking) {
 #ifdef _WIN32
-    return connect(socket, address->ai_addr, static_cast<int>(address->ai_addrlen));
+    u_long mode = blocking ? 0 : 1;
+    return ioctlsocket(socket, FIONBIO, &mode) == 0;
 #else
-    return connect(socket, address->ai_addr, address->ai_addrlen);
+    const int flags = fcntl(socket, F_GETFL, 0);
+    if (flags < 0) {
+        return false;
+    }
+
+    const int next_flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+    return fcntl(socket, F_SETFL, next_flags) == 0;
+#endif
+}
+
+bool SocketConnectInProgress() {
+#ifdef _WIN32
+    const int error = WSAGetLastError();
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEINVAL;
+#else
+    return errno == EINPROGRESS;
+#endif
+}
+
+int GetSocketError(SocketHandle socket) {
+    int socket_error = 0;
+#ifdef _WIN32
+    int length = sizeof(socket_error);
+    if (getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socket_error), &length) != 0) {
+        return WSAGetLastError();
+    }
+#else
+    socklen_t length = sizeof(socket_error);
+    if (getsockopt(socket, SOL_SOCKET, SO_ERROR, &socket_error, &length) != 0) {
+        return errno;
+    }
+#endif
+    return socket_error;
+}
+
+timeval ToTimeval(std::chrono::milliseconds timeout) {
+    timeval value{};
+    value.tv_sec = static_cast<long>(timeout.count() / 1000);
+    value.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+    return value;
+}
+
+void ApplyIoTimeouts(SocketHandle socket, std::chrono::milliseconds timeout) {
+#ifdef _WIN32
+    const DWORD timeout_ms = static_cast<DWORD>(timeout.count());
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms),
+               sizeof(timeout_ms));
+    setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms),
+               sizeof(timeout_ms));
+#else
+    timeval value = ToTimeval(timeout);
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value));
+    setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value));
+#endif
+}
+
+bool ConnectSocket(SocketHandle socket,
+                   const addrinfo* address,
+                   std::chrono::milliseconds timeout) {
+    if (!SetSocketBlocking(socket, false)) {
+        return false;
+    }
+
+#ifdef _WIN32
+    const int result = connect(socket, address->ai_addr, static_cast<int>(address->ai_addrlen));
+    if (result == 0) {
+        SetSocketBlocking(socket, true);
+        ApplyIoTimeouts(socket, timeout);
+        return true;
+    }
+#else
+    const int result = connect(socket, address->ai_addr, address->ai_addrlen);
+    if (result == 0) {
+        SetSocketBlocking(socket, true);
+        ApplyIoTimeouts(socket, timeout);
+        return true;
+    }
+#endif
+
+    if (!SocketConnectInProgress()) {
+        SetSocketBlocking(socket, true);
+        return false;
+    }
+
+    fd_set write_set;
+    FD_ZERO(&write_set);
+    FD_SET(socket, &write_set);
+
+    timeval wait_time = ToTimeval(timeout);
+    const int ready = select(static_cast<int>(socket + 1), nullptr, &write_set, nullptr, &wait_time);
+    if (ready <= 0 || !FD_ISSET(socket, &write_set) || GetSocketError(socket) != 0) {
+        SetSocketBlocking(socket, true);
+        return false;
+    }
+
+    SetSocketBlocking(socket, true);
+    ApplyIoTimeouts(socket, timeout);
+    return true;
+}
+
+bool IsInvalidAcceptedSocket(SocketHandle socket) {
+#ifdef _WIN32
+    return socket == INVALID_SOCKET;
+#else
+    return socket < 0;
 #endif
 }
 
@@ -141,7 +250,9 @@ bool ReceiveLine(SocketHandle socket, std::string& pending, std::string& line) {
     }
 }
 
-SocketHandle ConnectTcp(std::string_view host, std::uint16_t port) {
+SocketHandle ConnectTcp(std::string_view host,
+                        std::uint16_t port,
+                        std::chrono::milliseconds timeout) {
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -162,7 +273,7 @@ SocketHandle ConnectTcp(std::string_view host, std::uint16_t port) {
             continue;
         }
 
-        if (ConnectSocket(connected_socket, candidate) == 0) {
+        if (ConnectSocket(connected_socket, candidate, timeout)) {
             break;
         }
 
@@ -210,7 +321,8 @@ SocketHandle ListenTcp(std::uint16_t port) {
 }
 
 SocketHandle AcceptTcp(SocketHandle listener) {
-    return accept(listener, nullptr, nullptr);
+    const SocketHandle accepted = accept(listener, nullptr, nullptr);
+    return IsInvalidAcceptedSocket(accepted) ? kInvalidSocket : accepted;
 }
 
 }  // namespace kvstore::net

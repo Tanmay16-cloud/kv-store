@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -45,7 +46,9 @@ void CloseSocket(SocketHandle socket);
 bool SendLine(SocketHandle socket, std::string_view line);
 bool ReceiveLine(SocketHandle socket, std::string& pending, std::string& line);
 
-SocketHandle ConnectTcp(std::string_view host, std::uint16_t port);
+SocketHandle ConnectTcp(std::string_view host,
+                        std::uint16_t port,
+                        std::chrono::milliseconds timeout = std::chrono::milliseconds{500});
 SocketHandle ListenTcp(std::uint16_t port);
 SocketHandle AcceptTcp(SocketHandle listener);
 

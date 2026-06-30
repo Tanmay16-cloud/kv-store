@@ -401,6 +401,8 @@ void TestRaftElectionState() {
     Expect(heartbeat.accepted, "newer heartbeat should be accepted");
     ExpectEqual(node.CurrentTerm(), static_cast<std::uint64_t>(4), "heartbeat should update term");
     Expect(node.Role() == NodeRole::Follower, "newer heartbeat should step leader down");
+    ExpectEqual(node.KnownLeaderId().value_or(""), std::string("node-c"),
+                "heartbeat should remember known leader");
 }
 
 void TestRaftLogReplicationState() {

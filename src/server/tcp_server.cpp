@@ -24,6 +24,7 @@ namespace {
 constexpr std::chrono::milliseconds kHeartbeatInterval{1000};
 constexpr std::chrono::milliseconds kElectionPollInterval{200};
 constexpr std::chrono::milliseconds kBaseElectionTimeout{2500};
+constexpr std::chrono::milliseconds kPeerRpcTimeout{500};
 
 std::string TrimLeft(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -302,7 +303,7 @@ std::string ToCommandLine(const protocol::Command& command) {
 }
 
 net::SocketHandle ConnectToEndpoint(const FollowerEndpoint& follower) {
-    return net::ConnectTcp(follower.host, follower.port);
+    return net::ConnectTcp(follower.host, follower.port, kPeerRpcTimeout);
 }
 
 bool SendRequestToEndpoint(const FollowerEndpoint& follower,
@@ -314,9 +315,15 @@ bool SendRequestToEndpoint(const FollowerEndpoint& follower,
     }
 
     std::string pending;
-    const bool ok = net::ReceiveLine(socket_to_follower, pending, response) &&
-                    net::SendLine(socket_to_follower, request) &&
-                    net::ReceiveLine(socket_to_follower, pending, response);
+    std::string greeting;
+    response.clear();
+    bool ok = net::ReceiveLine(socket_to_follower, pending, greeting) &&
+              net::SendLine(socket_to_follower, request) &&
+              net::ReceiveLine(socket_to_follower, pending, response);
+
+    if (ok && response == "OK connected to kvstore") {
+        ok = net::ReceiveLine(socket_to_follower, pending, response);
+    }
 
     net::CloseSocket(socket_to_follower);
     return ok;
@@ -384,13 +391,14 @@ AppendFollowerResult ParseAppendFollowerResponse(const std::string& response,
 
 AppendFollowerResult AppendEntryToFollower(const FollowerEndpoint& follower,
                                            const std::string& leader_id,
+                                           std::uint64_t leader_term,
                                            const raft::LogEntry& entry,
                                            std::uint64_t previous_log_index,
                                            std::uint64_t previous_log_term,
                                            std::uint64_t leader_commit) {
     std::string response;
     const std::string request =
-        "RAFT APPEND " + std::to_string(entry.term) + " " + leader_id + " " +
+        "RAFT APPEND " + std::to_string(leader_term) + " " + leader_id + " " +
         std::to_string(previous_log_index) + " " + std::to_string(previous_log_term) + " " +
         std::to_string(leader_commit) + " " + std::to_string(entry.index) + " " +
         std::to_string(entry.term) + " " + ToCommandLine(entry.command);
@@ -399,7 +407,7 @@ AppendFollowerResult AppendEntryToFollower(const FollowerEndpoint& follower,
         return {};
     }
 
-    return ParseAppendFollowerResponse(response, entry.term);
+    return ParseAppendFollowerResponse(response, leader_term);
 }
 
 bool CommitEntryOnFollower(const FollowerEndpoint& follower,
@@ -432,10 +440,73 @@ bool ReplicateLogThroughEntry(const FollowerEndpoint& follower,
         const auto previous_log_term = raft_state.LogTermAt(previous_log_index).value_or(0);
         const auto result = AppendEntryToFollower(follower,
                                                   leader_id,
+                                                  raft_state.CurrentTerm(),
                                                   entry.value(),
                                                   previous_log_index,
                                                   previous_log_term,
                                                   raft_state.CommitIndex());
+        if (result.success) {
+            ++next_index;
+            continue;
+        }
+
+        if (next_index == 1) {
+            return false;
+        }
+
+        next_index = std::min(next_index - 1, result.match_index + 1);
+        if (next_index == 0) {
+            next_index = 1;
+        }
+    }
+
+    return true;
+}
+
+std::optional<std::uint64_t> LogTermAt(const std::vector<raft::LogEntry>& log,
+                                       std::uint64_t index) {
+    if (index == 0) {
+        return 0;
+    }
+    if (index > log.size()) {
+        return std::nullopt;
+    }
+
+    return log[index - 1].term;
+}
+
+std::optional<raft::LogEntry> LogEntryAt(const std::vector<raft::LogEntry>& log,
+                                         std::uint64_t index) {
+    if (index == 0 || index > log.size()) {
+        return std::nullopt;
+    }
+
+    return log[index - 1];
+}
+
+bool ReplicateLogSnapshotThroughIndex(const FollowerEndpoint& follower,
+                                      const std::string& leader_id,
+                                      std::uint64_t leader_term,
+                                      const std::vector<raft::LogEntry>& log,
+                                      std::uint64_t leader_commit,
+                                      std::uint64_t target_index) {
+    std::uint64_t next_index = target_index;
+
+    while (next_index <= target_index) {
+        const auto entry = LogEntryAt(log, next_index);
+        if (!entry.has_value()) {
+            return false;
+        }
+
+        const auto previous_log_index = next_index - 1;
+        const auto previous_log_term = LogTermAt(log, previous_log_index).value_or(0);
+        const auto result = AppendEntryToFollower(follower,
+                                                  leader_id,
+                                                  leader_term,
+                                                  entry.value(),
+                                                  previous_log_index,
+                                                  previous_log_term,
+                                                  leader_commit);
         if (result.success) {
             ++next_index;
             continue;
@@ -459,9 +530,14 @@ std::size_t AppendEntryToFollowers(const std::vector<FollowerEndpoint>& follower
                                    const raft::RaftState& raft_state,
                                    const raft::LogEntry& entry) {
     std::size_t acknowledgements = 1;
+    const auto cluster_size = followers.size() + 1;
+    const auto majority = (cluster_size / 2) + 1;
     for (const auto& follower : followers) {
         if (ReplicateLogThroughEntry(follower, leader_id, raft_state, entry)) {
             ++acknowledgements;
+            if (acknowledgements >= majority) {
+                break;
+            }
         }
     }
 
@@ -472,8 +548,16 @@ void CommitEntryOnFollowers(const std::vector<FollowerEndpoint>& followers,
                             const std::string& leader_id,
                             std::uint64_t term,
                             std::uint64_t commit_index) {
+    std::size_t acknowledgements = 1;
+    const auto cluster_size = followers.size() + 1;
+    const auto majority = (cluster_size / 2) + 1;
     for (const auto& follower : followers) {
-        if (!CommitEntryOnFollower(follower, leader_id, term, commit_index)) {
+        if (CommitEntryOnFollower(follower, leader_id, term, commit_index)) {
+            ++acknowledgements;
+            if (acknowledgements >= majority) {
+                break;
+            }
+        } else {
             std::cerr << "Commit failed for follower " << follower.host << ":"
                       << follower.port << ".\n";
         }
@@ -499,6 +583,8 @@ void HeartbeatLoop(const std::vector<FollowerEndpoint>& followers,
 
         std::string leader_id;
         std::uint64_t term = 0;
+        std::uint64_t commit_index = 0;
+        std::vector<raft::LogEntry> log_snapshot;
         {
             std::lock_guard lock(execution_mutex);
             if (raft_state.Role() != raft::NodeRole::Leader) {
@@ -506,12 +592,26 @@ void HeartbeatLoop(const std::vector<FollowerEndpoint>& followers,
             }
             leader_id = raft_state.NodeId();
             term = raft_state.CurrentTerm();
+            commit_index = raft_state.CommitIndex();
+            log_snapshot = raft_state.DurableState().log;
         }
 
         for (const auto& follower : followers) {
-            if (!SendHeartbeatToFollower(follower, leader_id, term)) {
-                std::cerr << "Heartbeat failed for follower " << follower.host << ":"
-                          << follower.port << ".\n";
+            bool ok = false;
+            if (commit_index > 0 && LogEntryAt(log_snapshot, commit_index).has_value()) {
+                ok = ReplicateLogSnapshotThroughIndex(follower,
+                                                      leader_id,
+                                                      term,
+                                                      log_snapshot,
+                                                      commit_index,
+                                                      commit_index);
+            } else {
+                ok = SendHeartbeatToFollower(follower, leader_id, term);
+            }
+
+            if (!ok) {
+                std::cerr << "Replication heartbeat failed for follower " << follower.host
+                          << ":" << follower.port << ".\n";
             }
         }
     }
